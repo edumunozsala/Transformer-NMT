@@ -10,45 +10,21 @@ import time
 import re
 import pandas as pd
 import numpy as np
+import tensorflow as tf
 
 from utils import preprocess_text_nonbreaking, subword_tokenize
+from utils_train import loss_function, CustomSchedule
 
 from model import Transformer
 
-def model_fn(model_dir):
-    """Load the PyTorch model from the `model_dir` directory."""
-    print("Loading model.")
+INPUT_COLUMN = 'input'
+TARGET_COLUMN = 'target'
+#NUM_SAMPLES = 80000 #40000
+#MAX_VOCAB_SIZE = 2**14
 
-    # First, load the parameters used to create the model.
-    model_info = {}
-    model_info_path = os.path.join(model_dir, 'model_info.pth')
-    with open(model_info_path, 'rb') as f:
-        model_info = torch.load(f)
-
-    print("model_info: {}".format(model_info))
-
-    # Determine the device and construct the model.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = RNNModel(model_info['vocab_size'], model_info['embedding_dim'], model_info['hidden_dim'], model_info['n_layers'], model_info['drop_rate'])
-
-    # Load the stored model parameters.
-    model_path = os.path.join(model_dir, 'model.pth')
-    with open(model_path, 'rb') as f:
-        model.load_state_dict(torch.load(f, map_location=lambda storage, loc: storage))
-
-    # Load the saved word_dict.
-    word_dict_path = os.path.join(model_dir, 'char_dict.pkl')
-    with open(word_dict_path, 'rb') as f:
-        model.char2int = pickle.load(f)
-
-    word_dict_path = os.path.join(model_dir, 'int_dict.pkl')
-    with open(word_dict_path, 'rb') as f:
-        model.int2char = pickle.load(f)
-
-    model.to(device).eval()
-
-    print("Done loading model.")
-    return model
+#BATCH_SIZE = 64  # Batch size for training.
+#EPOCHS = 10  # Number of epochs to train for.
+#MAX_LENGTH = 15
 
 def batch_generator_sequence(features_seq, label_seq, batch_size, seq_len):
     """Generator function that yields batches of data (input and target)
@@ -84,7 +60,7 @@ def batch_generator_sequence(features_seq, label_seq, batch_size, seq_len):
             yield x_epoch[batch], y_epoch[batch]
         epoch += 1
 
-def _get_train_data(batch_size, maxlen, training_dir, nonbreaking_in, nonbreaking_out):
+def get_train_data(training_dir, nonbreaking_in, nonbreaking_out, train_file, nsamples):
     print("Get the train data loader.")
     # Load the nonbreaking files
     with open(os.path.join(training_dir, nonbreaking_in), 
@@ -99,22 +75,15 @@ def _get_train_data(batch_size, maxlen, training_dir, nonbreaking_in, nonbreakin
     non_breaking_prefix_es = non_breaking_prefix_es.split("\n")
     non_breaking_prefix_es = [' ' + pref + '.' for pref in non_breaking_prefix_es]
     # Load the training data
-    
-    with open(os.path.join(training_dir, "input_data.pkl"), "rb") as fp:   # Unpickling
-       train_data = pickle.load(fp)
+    # Load the dataset: sentence in english, sentence in spanish 
+    df=pd.read_csv(train_filenamepath, sep="\t", header=None, names=[INPUT_COLUMN,TARGET_COLUMN], usecols=[0,1], 
+               nrows=nsamples)
+    # Preprocess the input data
+    input_data=df[INPUT_COLUMN].apply(lambda x : preprocess_text_nonbreaking(x, non_breaking_prefix_en)).tolist()
+    # Preprocess and include the end of sentence token to the target text
+    target_data=df[TARGET_COLUMN].apply(lambda x : preprocess_text_nonbreaking(x, non_breaking_prefix_es)).tolist()
 
-    #train_data = pd.read_csv(os.path.join(training_dir, "train.csv"), header=None, names=None)
-    # The input sequence, from 0 to len-1
-    input_seq=train_data[:-1]
-    # The target sequence, from 1 to len
-    target_seq=train_data[1:]
-
-    # Create a batch generator for training along the input data
-    batch_data = batch_generator_sequence(input_seq, target_seq, batch_size, maxlen)
-    # Calculate the number of batches to complete an epoch (all training data)
-    num_batches = len(input_seq) // (batch_size*maxlen)
-
-    return batch_data, num_batches
+    return input_data, target_data
 
 def set_device():
     # torch.cuda.is_available() checks and returns a Boolean True if a GPU is available, else it'll return False
@@ -130,80 +99,48 @@ def set_device():
     
     return device
 
-def train_main(model, optimizer, loss_fn, batch_data, num_batches, val_batches, batch_size, seq_len, n_epochs, clip_norm, device):
-    # Training Run
-    for epoch in range(1, n_epochs + 1):
-        start_time = time.time()
-        # Store the loss in every batch iteration
-        epoch_losses =[]
-        # Init the hidden state
-        hidden = model.init_state(device, batch_size)
-        # Train all the batches in every epoch
-        for i in range(num_batches-val_batches):
-            # Get the next batch data for input and target
-            input_batch, target_batch = next(batch_data)
-            # Onr hot encode the input data
-            input_batch = one_hot_encode(input_batch, model.vocab_size)
-            # Tranform to tensor
-            input_data = torch.from_numpy(input_batch)
-            target_data = torch.from_numpy(target_batch)
-            # Create a new variable for the hidden state, necessary to calculate the gradients
-            hidden = tuple(([Variable(var.data) for var in hidden]))
-            # Move the input data to the device
-            input_data = input_data.to(device)
-            # Set the model to train and prepare the gradients
-            model.train()
-            optimizer.zero_grad() # Clears existing gradients from previous epoch
-            # Pass Fordward the RNN
-            output, hidden = model(input_data, hidden)
-            output = output.to(device)
-            # Move the target data to the device
-            target_data = target_data.to(device)
-            target_data = torch.reshape(target_data, (batch_size*seq_len,))
+def main_train(dataset, transformer, n_epochs, print_every=50):
+  ''' Train the transformer model for n_epochs using the data generator dataset'''
+  losses = []
+  accuracies = []
+  # In every epoch
+  for epoch in range(n_epochs):
+    print("Starting epoch {}".format(epoch+1))
+    start = time.time()
+    # Reset the losss and accuracy calculations
+    train_loss.reset_states()
+    train_accuracy.reset_states()
+    # Get a batch of inputs and targets
+    for (batch, (enc_inputs, targets)) in enumerate(dataset):
+        # Set the decoder inputs
+        dec_inputs = targets[:, :-1]
+        # Set the target outputs, right shifted
+        dec_outputs_real = targets[:, 1:]
+        with tf.GradientTape() as tape:
+            # Call the transformer and get the predicted output
+            predictions = transformer(enc_inputs, dec_inputs, True)
             # Calculate the loss
-            loss = loss_fn(output, target_data.view(batch_size*seq_len))
-            # Save the loss
-            epoch_losses.append(loss.item()) #data[0]
-            # Does backpropagation and calculates gradients
-            loss.backward()
-            # clip gradient norm
-            nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
-            # Updates the weights accordingly
-            optimizer.step()
-    
-        # Now, when the epoch is finished, evaluate the model on validation data
-        model.eval()
-        val_hidden = model.init_state(device, batch_size)
-        val_losses = []
-        for i in range(val_batches):
-            # Get the next batch data for input and target
-            input_batch, target_batch = next(batch_data)
-            # Onr hot encode the input data
-            input_batch = one_hot_encode(input_batch, model.vocab_size)
-            # Tranform to tensor
-            input_data = torch.from_numpy(input_batch)
-            target_data = torch.from_numpy(target_batch)
-            # Create a new variable for the hidden state, necessary to calculate the gradients
-            hidden = tuple(([Variable(var.data) for var in val_hidden]))
-            # Move the input data to the device
-            input_data = input_data.to(device)
-            # Pass Fordward the RNN
-            output, hidden = model(input_data, hidden)
-            output = output.to(device)
-            # Move the target data to the device
-            target_data = target_data.to(device)
-            target_data = torch.reshape(target_data, (batch_size*seq_len,))
-            loss = loss_fn(output, target_data.view(batch_size*seq_len))
-            # Save the loss
-            val_losses.append(loss.item()) #data[0]
-
-        model.train()                  
-        print('Epoch: {}/{}.............'.format(epoch, n_epochs), end=' ')
-        print('Time: {:.4f}'.format(time.time() - start_time), end=' ')
-        print("Train Loss: {:.4f}".format(np.mean(epoch_losses)), end=' ')
-        print("Val Loss: {:.4f}".format(np.mean(val_losses)))
+            loss = loss_function(dec_outputs_real, predictions)
+        # Update the weights and optimizer
+        gradients = tape.gradient(loss, transformer.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
+        # Save and store the metrics
+        train_loss(loss)
+        train_accuracy(dec_outputs_real, predictions)
         
-    return epoch_losses
+        if batch % print_every == 0:
+            losses.append(train_loss.result())
+            accuracies.append(train_accuracy.result())
+            print("Epoch {} Batch {} Loss {:.4f} Accuracy {:.4f}".format(
+                epoch+1, batch, train_loss.result(), train_accuracy.result()))
+            
+    # Checkpoint the model on every epoch        
+    ckpt_save_path = ckpt_manager.save()
+    print("Saving checkpoint for epoch {} in {}".format(epoch+1,
+                                                        ckpt_save_path))
+    #print("Time for 1 epoch: {} secs\n".format(time.time() - start))
+  return losses, accuracies
+
 
 if __name__ == '__main__':
     # All of the model parameters and training parameters are sent as arguments when the script
@@ -218,10 +155,17 @@ if __name__ == '__main__':
                         help='input max sequence length for training (default: 60)')
     parser.add_argument('--epochs', type=int, default=2, metavar='N',
                         help='number of epochs to train (default: 2)')
-    parser.add_argument('--lr', type=float, default=0.01, metavar='N',
-                        help='learning rate to train (default: 0.01)')
-    parser.add_argument('--clip_norm', type=int, default=5, metavar='N',
-                        help='Gradients clip norm (default: 5)')
+    parser.add_argument('--nsamples', type=int, default=20000, metavar='N',
+                        help='number of samples to train (default: 20000)')
+
+    # Data parameters                    
+    parser.add_argument('--train_file', type=str, default=None, metavar='N',
+                        help='Training data file name')
+    parser.add_argument('--non_breaking_in', type=str, default=None, metavar='N',
+                        help='Non breaking prefixes for input vocabulary')
+    parser.add_argument('--non_breaking_out', type=str, default=None, metavar='N',
+                        help='Non breaking prefixes for output vocabulary')
+
     parser.add_argument('--val-frac', type=float, default=0.1, metavar='N',
                         help='Fraction og data for validation (default: 0.1)')
 
@@ -229,14 +173,18 @@ if __name__ == '__main__':
                         help='random seed (default: 1)')
 
     # Model Parameters
-    parser.add_argument('--embedding_dim', type=int, default=38, metavar='N',
-                        help='size of the word embeddings (default: 32)')
-    parser.add_argument('--hidden_dim', type=int, default=100, metavar='N',
-                        help='size of the hidden dimension (default: 100)')
-    parser.add_argument('--vocab_size', type=int, default=38, metavar='N',
-                        help='size of the vocabulary (default: 28)')
-    parser.add_argument('--n_layers', type=int, default=1, metavar='N',
-                        help='number of layers (default: 1)')
+    parser.add_argument('--d_model', type=int, default=64, metavar='N',
+                        help='Model dimension (default: 64)')
+    parser.add_argument('--ffn_dim', type=int, default=128, metavar='N',
+                        help='size of the FFN layer (default: 128)')
+    parser.add_argument('--vocab_size', type=int, default=10000, metavar='N',
+                        help='size of the vocabulary (default: 10000)')
+    parser.add_argument('--n_layers', type=int, default=4, metavar='N',
+                        help='number of layers (default: 4)')
+    parser.add_argument('--n_heads', type=int, default=6, metavar='N',
+                        help='number of heads (default: 6)')
+    parser.add_argument('--dropout_rate', type=float, default=0.1, metavar='N',
+                        help='Dropout rate (default: 0.1)')
 
     # SageMaker Parameters
     parser.add_argument('--hosts', type=list, default=json.loads(os.environ['SM_HOSTS']))
@@ -250,56 +198,70 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device {}.".format(device))
 
-    torch.manual_seed(args.seed)
-
     # Load the training data.
-    train_loader, num_batches = _get_train_data_loader(args.batch_size, args.max_len, args.data_dir)
-    # Calculate the validation batches
-    val_batches = int(num_batches*args.val_frac)
-    # Build the model.
-    # Instantiate the model with hyperparameters
-    model = RNNModel(args.vocab_size,args.vocab_size, args.hidden_dim, args.n_layers).to(device)
+    input_data, target_data = get_train_data(args.data_dir, args.non_breaking_in, args.non_breaking_out, args.train_file, args.nsamples)
 
-    # Load the dictionaries
-    with open(os.path.join(args.data_dir, "char_dict.pkl"), "rb") as f:
-        model.char2int = pickle.load(f)
+    # Tokenize and pad the input sequences
+    encoder_inputs, tokenizer_inputs, num_words_inputs, sos_token_input, eos_token_input, del_idx_inputs= subword_tokenize(input_data, 
+                                                                                                        args.vocab_size, args.max_len)
+    # Tokenize and pad the outputs sequences
+    decoder_outputs, tokenizer_outputs, num_words_output, sos_token_output, eos_token_output, del_idx_outputs = subword_tokenize(target_data, 
+                                                                                                        args.vocab_size, args.max_len)
+    # Define a dataset 
+    dataset = tf.data.Dataset.from_tensor_slices(
+                    (encoder_inputs, decoder_outputs))
+    dataset = dataset.shuffle(len(input_data), reshuffle_each_iteration=True).batch(
+                    BATCH_SIZE, drop_remainder=True)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
-    with open(os.path.join(args.data_dir, "int_dict.pkl"), "rb") as f:
-        model.int2char = pickle.load(f)
+    # Clean the session
+    tf.keras.backend.clear_session()
+    # Create the Transformer model
+    transformer = Transformer(vocab_size_enc=num_words_inputs,
+                          vocab_size_dec=num_words_output,
+                          d_model=args.d_model,
+                          n_layers=args.n_layers,
+                          FFN_units=args.ffn_dim,
+                          n_heads=args.n_heads,
+                          dropout_rate=args.dropout_rate)
 
-    print("Model loaded with embedding_dim {}, hidden_dim {}, vocab_size {}.".format(
-        args.embedding_dim, args.hidden_dim, args.vocab_size
-    ))
+    # Define a categorical cross entropy loss
+    loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True,
+                                                            reduction="none")
+    # Define a metric to store the mean loss of every epoch
+    train_loss = tf.keras.metrics.Mean(name="train_loss")
+    # Define a matric to save the accuracy in every epoch
+    train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name="train_accuracy")
+    # Create the scheduler for learning rate decay
+    leaning_rate = CustomSchedule(D_MODEL)
+    # Create the Adam optimizer
+    optimizer = tf.keras.optimizers.Adam(leaning_rate,
+                                     beta_1=0.9,
+                                     beta_2=0.98,
+                                     epsilon=1e-9)
 
-    # Train the model.
-    # Define Loss, Optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    #Create the Checkpoint 
+    ckpt = tf.train.Checkpoint(transformer=transformer,
+                           optimizer=optimizer)
 
-    train_main(model, optimizer, criterion, train_loader, num_batches, val_batches, args.batch_size, args.max_len, args.epochs, args.clip_norm, device)
+    ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=1)
 
-    # Save the parameters used to construct the model
-    model_info_path = os.path.join(args.model_dir, 'model_info.pth')
-    with open(model_info_path, 'wb') as f:
-        model_info = {
-            'n_layers': args.n_layers,
-            'embedding_dim': args.vocab_size,
-            'hidden_dim': args.hidden_dim,
-            'vocab_size': args.vocab_size,
-            'drop_rate': 0.2
-        }
-        torch.save(model_info, f)
+    #if ckpt_manager.latest_checkpoint:
+    #    ckpt.restore(ckpt_manager.latest_checkpoint)
+    #    print("Last checkpoint restored.")
+    
+    # Train the model
+    losses, accuracies = main_train(dataset, transformer, args.epochs, 100)
 
-	# Save the word_dict
-    word_dict_path = os.path.join(args.model_dir, 'char_dict.pkl')
-    with open(word_dict_path, 'wb') as f:
-        pickle.dump(model.char2int, f)
+    # Save the while model
+    # Save the entire model to a HDF5 file
+    transformer.save(os.path.join(args.model_dir, 'transformer.h5'))
 
-    word_dict_path = os.path.join(args.model_dir, 'int_dict.pkl')
-    with open(word_dict_path, 'wb') as f:
-        pickle.dump(model.int2char, f)
+	# Save the tokenizers with the vocabularies
+    vocabulary_in = os.path.join(args.model_dir, 'in_vocab.pkl')
+    with open(vocabulary_in, 'wb') as f:
+        pickle.dump(tokenizer_inputs, f)
 
-	# Save the model parameters
-    model_path = os.path.join(args.model_dir, 'model.pth')
-    with open(model_path, 'wb') as f:
-        torch.save(model.state_dict(), f)
+    vocabulary_out = os.path.join(args.model_dir, 'out_vocab.pkl')
+    with open(vocabulary_out, 'wb') as f:
+        pickle.dump(tokenizer_outputs, f)
