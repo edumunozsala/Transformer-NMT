@@ -1,15 +1,14 @@
-try:
-    %tensorflow_version 2.x
-except:
-    pass
+#try:
+#    %tensorflow_version 2.x
+#except:
+#    pass
+
+import numpy as np
 import tensorflow as tf
 
 from tensorflow.keras import layers
 from tensorflow.keras import backend as K
-import tensorflow_datasets as tfds
-
-from keras.preprocessing.text import Tokenizer
-from keras.preprocessing.sequence import pad_sequences
+#import tensorflow_datasets as tfds
 
 # Scaled dot product Attention 
 def scaled_dot_product_attention(queries, keys, values, mask):

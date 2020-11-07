@@ -5,7 +5,9 @@ import pickle
 import os
 
 import tensorflow_datasets as tfds
-from keras.preprocessing.sequence import pad_sequences
+import tensorflow as tf
+
+#from keras.preprocessing.sequence import pad_sequences
 
 def clean_text(sentences, alpha=False):
     ''' Cleaning process of the text'''
